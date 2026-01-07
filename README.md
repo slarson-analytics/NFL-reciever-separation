@@ -19,6 +19,6 @@ This project analyzes NFL player tracking data to measure in-air separation gain
 - IASG provides additional context beyond traditional separation metrics
 
 ## Tools Used
-- Python / R (depending on what you used)
+- R 
 - Data visualization libraries
 - Statistical analysis
