@@ -1,0 +1,569 @@
+```{r, echo=FALSE}
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggeffects)
+```
+
+
+```{r}
+supp_data = read.csv("supplementary_data.csv")
+
+for (i in 1:18) {
+  wk <- sprintf("%02d", i)
+  
+  df <- read.csv(
+    paste0(
+      "/Users/sarahlarson/Downloads/sports stats/114239_nfl_competition_files_published_analytics_final/train/input_2023_w",
+      wk,
+      ".csv"
+    )
+  )
+  
+
+
+  assign(paste0("week", wk, "_input_train"), df)
+}
+
+for (i in 1:18) {
+  wk <- sprintf("%02d", i)
+  
+  df <- read.csv(
+    paste0(
+      "/Users/sarahlarson/Downloads/sports stats/114239_nfl_competition_files_published_analytics_final/train/output_2023_w",
+      wk,
+      ".csv"
+    )
+  )
+  
+  assign(paste0("week", wk, "_output_train"), df)
+}
+```
+
+
+```{r}
+input_names  <- sprintf("week%02d_input_train", 1:18)
+output_names <- sprintf("week%02d_output_train", 1:18)
+
+input_df <- bind_rows(mget(input_names))
+
+# combining all outputs into one big data frame
+output_df <- bind_rows(mget(output_names))
+```
+
+
+```{r}
+roster_df <- input_df %>%
+  distinct(game_id, play_id, nfl_id, player_side, player_role)
+
+output_df <- output_df %>%
+  left_join(roster_df, by = c("game_id", "play_id", "nfl_id"))
+```
+
+
+```{r}
+# which player is the targeted WR on each play
+targets <- input_df %>%
+  filter(player_role == "Targeted Receiver") %>%
+  distinct(game_id, play_id, wr_nfl_id = nfl_id)
+
+# frame of the THROW = last frame in input
+throw_frames <- input_df %>%
+  group_by(game_id, play_id) %>%
+  summarise(throw_frame = max(frame_id), .groups = "drop")
+
+# frame of the CATCH / arrival = last frame in output
+catch_frames <- output_df %>%
+  group_by(game_id, play_id) %>%
+  summarise(catch_frame = max(frame_id), .groups = "drop")
+
+```
+
+
+```{r}
+# WR position at throw
+wr_throw <- input_df %>%
+  inner_join(targets, by = c("game_id", "play_id", "nfl_id" = "wr_nfl_id")) %>%
+  inner_join(throw_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == throw_frame) %>%
+  transmute(game_id, play_id, wr_nfl_id = nfl_id,
+            wr_x0 = x, wr_y0 = y)
+
+# defenders at throw
+def_throw <- input_df %>%
+  inner_join(throw_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == throw_frame,
+         player_side == "Defense") %>%
+  transmute(game_id, play_id,
+            def_nfl_id = nfl_id,
+            def_x0 = x, def_y0 = y)
+
+# separation at throw = min distance to any defender
+sep_throw <- def_throw %>%
+  inner_join(wr_throw, by = c("game_id", "play_id")) %>%
+  mutate(dist0 = sqrt((wr_x0 - def_x0)^2 + (wr_y0 - def_y0)^2)) %>%
+  group_by(game_id, play_id, wr_nfl_id) %>%
+  summarise(sep_t0 = min(dist0, na.rm = TRUE), .groups = "drop")
+
+```
+
+
+```{r}
+# WR position at catch frame
+wr_catch <- output_df %>%
+  inner_join(targets, by = c("game_id", "play_id", "nfl_id" = "wr_nfl_id")) %>%
+  inner_join(catch_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == catch_frame) %>%
+  transmute(game_id, play_id, wr_nfl_id = nfl_id,
+            wr_x1 = x, wr_y1 = y)
+
+# defenders at catch frame
+def_catch <- output_df %>%
+  inner_join(catch_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == catch_frame,
+         player_side == "Defense") %>%
+  transmute(game_id, play_id,
+            def_nfl_id = nfl_id,
+            def_x1 = x, def_y1 = y)
+
+# separation at catch = min distance to any defender
+sep_catch <- def_catch %>%
+  inner_join(wr_catch, by = c("game_id", "play_id")) %>%
+  mutate(dist1 = sqrt((wr_x1 - def_x1)^2 + (wr_y1 - def_y1)^2)) %>%
+  group_by(game_id, play_id, wr_nfl_id) %>%
+  summarise(sep_t1 = min(dist1, na.rm = TRUE), .groups = "drop")
+
+```
+
+
+```{r}
+# In-Air Separation Gain
+iasg_df <- sep_throw %>%
+  inner_join(sep_catch, by = c("game_id", "play_id", "wr_nfl_id")) %>%
+  mutate(IASG = sep_t1 - sep_t0)
+
+# bring in supplementary data (routes, coverage, pass_result, etc.)
+plays_enriched <- iasg_df %>%
+  inner_join(supp_data, by = c("game_id", "play_id")) %>%
+  select(game_id, play_id, wr_nfl_id,
+         route_of_targeted_receiver,
+         team_coverage_man_zone,
+         pass_result,
+         sep_t0, sep_t1, IASG,
+         everything())
+```
+
+
+```{r}
+plays_enriched %>%
+  group_by(route_of_targeted_receiver, team_coverage_man_zone) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    mean_sep_t0 = mean(sep_t0, na.rm = TRUE),
+    mean_sep_t1 = mean(sep_t1, na.rm = TRUE)
+  ) %>%
+  arrange(desc(mean_IASG))
+
+
+plays_clean <- plays_enriched %>%
+  filter(
+    !is.na(IASG),
+    !is.na(route_of_targeted_receiver),
+    !is.na(team_coverage_man_zone)
+  )
+
+route_cov_summary <- plays_clean %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n         = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    mean_sep_t0 = mean(sep_t0, na.rm = TRUE),
+    mean_sep_t1 = mean(sep_t1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 150) %>%
+  arrange(desc(mean_IASG))
+```
+
+
+```{r}
+ggplot(route_cov_summary,
+       aes(x = reorder(route_of_targeted_receiver, mean_IASG),
+           y = mean_IASG,
+           fill = coverage_simple)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "In-Air Separation Gain by Route and Coverage",
+    x = "Route of Targeted Receiver",
+    y = "Mean In-Air Separation Gain (yards)",
+    fill = "Coverage Type"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+
+
+```{r}
+plays_enriched <- plays_enriched %>%
+  mutate(
+    complete = ifelse(pass_result == "C", 1, 0),
+    team_coverage_man_zone = as.factor(team_coverage_man_zone)
+  )
+
+completion_model <- glm(
+  complete ~ IASG + team_coverage_man_zone,
+  data = plays_enriched,
+  family = binomial
+)
+
+summary(completion_model)
+
+
+pred <- ggpredict(completion_model, terms = c("IASG [all]", "team_coverage_man_zone")) %>%
+  as.data.frame() %>%
+  rename(
+    IASG = x,
+    predicted = predicted,
+    conf_low = conf.low,
+    conf_high = conf.high,
+    coverage = group
+  )
+
+# Plot
+ggplot(pred, aes(x = IASG, y = predicted, color = coverage)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(x = IASG, ymin = conf_low, ymax = conf_high, fill = coverage),
+              alpha = 0.2, inherit.aes = FALSE) +
+  labs(
+    title = "Predicted Completion Probability by IASG and Coverage",
+    x = "In-Air Separation Gain (IASG)",
+    y = "Predicted Completion Probability",
+    color = "Coverage",
+    fill = "Coverage"
+  ) +
+  theme_minimal()
+```
+
+
+
+```{r}
+set.seed(310)  
+
+plays_sample <- plays_clean %>%
+  sample_n(size = min(5000, n())) %>%  
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  )
+
+ggplot(plays_sample,
+       aes(x = sep_t0,
+           y = sep_t1,
+           color = coverage_simple)) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Separation at Throw vs at Arrival",
+    subtitle = "Points above the line = WR gets more open during balls flight (positive IASG)",
+    x = "Separation at Throw (yards)",
+    y = "Separation at Arrival (yards)",
+    color = "Coverage"
+  )
+```
+
+
+
+```{r}
+plays_depth <- plays_clean %>%
+  mutate(
+    pass_len_bucket = case_when(
+      pass_length < 0              ~ "< 0 (Behind LOS)",
+      pass_length >= 0 & pass_length < 10  ~ "0–9",
+      pass_length >= 10 & pass_length < 20 ~ "10–19",
+      pass_length >= 20 & pass_length < 30 ~ "20–29",
+      pass_length >= 30                   ~ "30+",
+      TRUE ~ "Unknown"
+    ),
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  )
+
+depth_summary <- plays_depth %>%
+  filter(pass_len_bucket != "Unknown") %>%
+  group_by(pass_len_bucket, coverage_simple) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(depth_summary,
+       aes(x = pass_len_bucket,
+           y = mean_IASG,
+           group = coverage_simple,
+           color = coverage_simple)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Mean IASG by Depth of Target and Coverage",
+    x = "Pass Length Bucket (yards past LOS)",
+    y = "Mean IASG (yards)",
+    color = "Coverage"
+  )
+
+```
+
+
+```{r}
+## Team-level IASG: offense
+
+offense_summary <- plays_clean %>%
+  group_by(possession_team) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%           # drop tiny-sample teams if needed
+  arrange(desc(mean_IASG))
+
+offense_summary
+
+ggplot(offense_summary,
+       aes(x = reorder(possession_team, mean_IASG),
+           y = mean_IASG)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Offensive Teams by In-Air Separation Gain",
+    x = "Offense Team",
+    y = "Mean IASG (yards)"
+  )
+
+## Team-level IASG: defense
+
+defense_summary <- plays_clean %>%
+  group_by(defensive_team) %>%
+  summarise(
+    n = n(),
+    mean_IASG_allowed = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%
+  arrange(mean_IASG_allowed)    # low = good defense
+
+defense_summary
+
+ggplot(defense_summary,
+       aes(x = reorder(defensive_team, mean_IASG_allowed),
+           y = mean_IASG_allowed)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Defensive Teams by In-Air Separation Allowed",
+    x = "Defense Team",
+    y = "Mean IASG Allowed (yards)"
+  )
+```
+
+
+```{r}
+plays_adv <- plays_clean %>%
+  filter(!is.na(expected_points_added)) %>%
+  mutate(
+    WR_advantage = IASG * expected_points_added
+  )
+
+adv_route_cov <- plays_adv %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n = n(),
+    mean_WR_adv = mean(WR_advantage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30) %>%
+  arrange(desc(mean_WR_adv))
+
+adv_route_cov
+
+
+ggplot(adv_route_cov,
+       aes(x = coverage_simple,
+           y = route_of_targeted_receiver,
+           fill = mean_WR_adv)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "WR Advantage Score (IASG × EPA) by Route and Coverage",
+    x = "Coverage",
+    y = "Route",
+    fill = "Mean WR Advantage"
+  )
+```
+
+
+```{r}
+offense_adv <- plays_adv %>%
+  group_by(possession_team) %>%
+  summarise(
+    n = n(),
+    mean_WR_adv = mean(WR_advantage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%
+  arrange(desc(mean_WR_adv))
+
+ggplot(offense_adv,
+       aes(x = reorder(possession_team, mean_WR_adv),
+           y = mean_WR_adv)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Offensive Teams by WR Advantage (IASG × EPA)",
+    x = "Offense Team",
+    y = "Mean WR Advantage"
+  )
+
+```
+
+
+```{r}
+plays_model <- plays_clean %>%
+  filter(
+    !is.na(IASG),
+    !is.na(route_of_targeted_receiver),
+    !is.na(team_coverage_man_zone),
+    !is.na(pass_length),
+    !is.na(defenders_in_the_box),
+    !is.na(dropback_type)
+  ) %>%
+  mutate(
+    route_of_targeted_receiver = as.factor(route_of_targeted_receiver),
+    team_coverage_man_zone     = as.factor(team_coverage_man_zone),
+    dropback_type              = as.factor(dropback_type)
+  )
+
+
+iasg_model <- lm(
+  IASG ~ route_of_targeted_receiver +
+    team_coverage_man_zone +
+    pass_length +
+    defenders_in_the_box +
+    dropback_type,
+  data = plays_model
+)
+
+summary(iasg_model)
+```
+
+
+```{r}
+plays_model <- plays_model %>%
+  mutate(
+    IASG_exp = predict(iasg_model, newdata = .),
+    SAOE     = IASG - IASG_exp   
+  )
+
+
+plays_enriched <- plays_enriched %>%
+  left_join(
+    plays_model %>%
+      select(game_id, play_id, wr_nfl_id, IASG_exp, SAOE),
+    by = c("game_id", "play_id", "wr_nfl_id")
+  )
+```
+
+
+```{r}
+route_cov_saoe <- plays_model %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ as.character(team_coverage_man_zone)
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n         = n(),
+    mean_SAOE = mean(SAOE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30) %>%
+  arrange(desc(mean_SAOE))
+
+route_cov_saoe
+
+ggplot(route_cov_saoe,
+       aes(x = coverage_simple,
+           y = route_of_targeted_receiver,
+           fill = mean_SAOE)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "Separation Added Over Expectation (SAOE) by Route and Coverage",
+    x = "Coverage",
+    y = "Route",
+    fill = "Mean SAOE (yards)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+```{r}
+wr_saoe <- plays_model %>%
+  group_by(wr_nfl_id) %>%
+  summarise(
+    n = n(),
+    mean_SAOE = mean(SAOE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20) %>%   # require enough targets
+  arrange(desc(mean_SAOE))
+
+
+player_lookup <- input_df %>%
+  distinct(nfl_id, player_name) %>%
+  filter(!is.na(nfl_id), !is.na(player_name))
+
+wr_saoe_named <- wr_saoe %>%
+  left_join(player_lookup, by = c("wr_nfl_id" = "nfl_id")) %>%
+  arrange(desc(mean_SAOE))
+
+head(wr_saoe_named, 20)
+```
