@@ -1,24 +1,30 @@
-# NFL Receiver Separation Analysis
+# NFL Data Bowl Analysis
 
 ## Overview
-This project analyzes NFL player tracking data from the 2026 Big Data Bowl to create and measure in-air separation gain (IASG) as a new metric to be used by the NFL and examine how late-window separation relates to completion probability.
+This project was developed for the NFL Data Bowl competition and analyzes player tracking data to evaluate receiver separation and its relationship to completion probability. The goal was to move beyond traditional separation metrics and isolate receiver skill during the catch window.
 
-## Data -- Acquired from Kaggle
+## Data
 - NFL player tracking data
 - Play-by-play and route-level information
+- Supplementary processed datasets used for modeling and visualization
 
 ## Methods
-- Calculated pre-throw vs. post-throw separation metrics
-- Analyzed in-air separation gain (IASG)
+- Computed pre-throw and post-throw separation metrics
+- Developed In-Air Separation Gain (IASG) to capture late-window receiver movement
 - Linked separation metrics to completion probability
-- Created visualizations to compare routes and receiver performance
+- Analyzed differences across route types and player roles
+- Created visualizations to communicate spatial and probabilistic patterns
 
-## Key Takeaways
-- Late-window separation captures receiver skill better than pre-throw separation
-- Certain routes allow receivers to generate separation after the ball is thrown
-- IASG provides additional context beyond traditional separation metrics
+## Key Findings
+- Late-window separation provides stronger insight into receiver skill than pre-throw separation
+- Certain routes consistently allow receivers to gain separation after the ball is thrown
+- IASG adds context beyond traditional separation statistics used in evaluation
+
+## Files
+- `analysis.Rmd` – Full analysis and methodology
+- `report.html` – Rendered report with visualizations
 
 ## Tools Used
-- R 
-- Data visualization libraries
-- Statistical analysis
+- R (tidyverse, ggplot2)
+- Statistical modeling
+- Data visualization
