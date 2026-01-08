@@ -1,5 +1,8 @@
 # NFL Data Bowl Analysis
 
+ **[Read the full analysis report](REPORT.md)**  
+ **Code:** `analysis.R`
+
 ## Overview
 This project was developed for the NFL Data Bowl competition and analyzes player tracking data to evaluate receiver separation and its relationship to completion probability. The goal was to move beyond traditional separation metrics and isolate receiver skill during the catch window.
 
