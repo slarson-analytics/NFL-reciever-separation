@@ -1,9 +1,9 @@
 # NFL Receiver Separation Analysis
 
 ## Overview
-This project analyzes NFL player tracking data to measure in-air separation gain (IASG) and examine how late-window separation relates to completion probability.
+This project analyzes NFL player tracking data from the 2026 Big Data Bowl to create and measure in-air separation gain (IASG) as a new metric to be used by the NFL and examine how late-window separation relates to completion probability.
 
-## Data
+## Data -- Acquired from Kaggle
 - NFL player tracking data
 - Play-by-play and route-level information
 
