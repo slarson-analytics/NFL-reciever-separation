@@ -1,0 +1,652 @@
+---
+title: "NFL Data Bowl Competition"
+author: "Sarah Larson, Caitlin Robel, Noe Goldhaber, Alexis Hunting"
+date: "2025-11-20"
+output: html_document
+---
+### 1. Introduction and Problem Motivation
+
+Player-tracking data has transformed modern football analytics by enabling frame-level analysis of movement, positioning, and interaction between skill players and defenders. However, most separation-based statistics—both in public analytics and team scouting contexts—measure receiver separation only at a single point in time, typically at the moment of the catch (for completions) or at throw release. These measures ignore a critical component of receiver–defender interaction: the change in separation while the ball is in the air. Receivers may accelerate away from defenders, defenders may close aggressively, and route leverage may evolve in ways that have meaningful influence on play outcomes.
+
+**Our central question:**
+How much separation does a receiver gain (or lose) while the ball is in the air—and what factors explain that gain?
+
+This report introduces and analyzes In-Air Separation Gain (IASG), a metric designed to quantify the change in receiver–defender separation between the throw frame and the catch (or arrival) frame. IASG isolates mid-play separation dynamics that traditional metrics overlook. The central objective of this study is to determine how IASG varies across route types, coverage schemes, pass depths, offensive teams, and defensive units, and to assess how strongly IASG contributes to completion probability and overall play value.
+
+**IASG=Separation at Arrival−Separation at Throw**
+
+A positive IASG means the WR gets more open while the ball is traveling. A negative IASG means the defender closes the gap. This metric is interesting because it isolates receiver skill during the ball’s flight—not just route running, captures defender pursuit quality and closing speed, links directly to completion probability and expected points, and can help identify undervalued receivers and defensive units.
+
+To produce player-level evaluations, the study extends IASG into a second metric: Separation Added Over Expectation (SAOE). This is defined as the difference between a receiver’s observed IASG and the IASG predicted by a multivariate linear model that accounts for route, coverage type, pass depth, defensive structure, and quarterback dropback type. SAOE therefore measures how much separation a player creates—or loses—relative to what the play design and situation would typically generate. Together, IASG and SAOE offer a new lens for evaluating receiver performance and defensive closing ability.
+
+**SAOE = IASG − IASG(expected)**
+
+The remainder of this report describes the dataset and modeling process, outlines the computational steps used to derive the new metrics, and presents the findings in the context of both individual players and team-level performance. Limitations and directions for future refinement conclude the report.
+
+```{r, echo=FALSE}
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(ggeffects)
+```
+
+### 2. Data and Methods
+
+The dataset consists of all eighteen weeks of the 2023 NFL Big Data Bowl tracking files, including both input tracking files (which contain player positions and identifiers for each frame prior to the throw) and output tracking files (which describe receiver and defender positions from the ball’s release to its arrival). Supplementary play-level information provides route labels, coverage types, expected points added (EPA), pass depth, formation information, and team identifiers.
+
+After row-binding all weekly files into comprehensive input and output datasets, the analysis identifies the targeted receiver for each play using the tracking designation “Targeted Receiver.” For each play, the throw frame is defined as the final frame in the input file for that play, and the arrival frame is the final frame in the output file. At each of these frames, the minimum Euclidean distance between the targeted receiver and any defender is computed; these values are denoted as separation at throw (sep_t0) and separation at arrival (sep_t1). IASG is computed as the difference sep_t1 − sep_t0.
+
+Next, IASG is merged with supplementary data to create a complete play-level dataset containing route type, coverage classification (man versus zone), pass result, EPA, pass depth, dropback type, and other contextual variables. This enriched dataset supports both summary analysis and formal modeling.
+
+To estimate the expected IASG given play context, a linear model is fit using IASG as the response and the following predictors: route of the targeted receiver, man/zone coverage, pass length in yards, number of defenders in the box, and quarterback dropback type. The fitted values from this model represent the expected IASG for each play. SAOE is then defined as the observed IASG minus its model-based expectation, producing a context-adjusted measure of separation gain.
+
+Finally, the analysis computes a WR Advantage Score, defined as the multiplicative interaction between IASG and EPA (IASG × EPA). This quantity captures how much in-air separation contributes to overall play value, rather than treating separation dynamics as independent of down-and-distance context.
+
+```{r}
+supp_data = read.csv("supplementary_data.csv")
+
+for (i in 1:18) {
+  wk <- sprintf("%02d", i)
+  
+  df <- read.csv(
+    paste0(
+      "/Users/sarahlarson/Downloads/sports stats/114239_nfl_competition_files_published_analytics_final/train/input_2023_w",
+      wk,
+      ".csv"
+    )
+  )
+  
+
+
+  assign(paste0("week", wk, "_input_train"), df)
+}
+
+for (i in 1:18) {
+  wk <- sprintf("%02d", i)
+  
+  df <- read.csv(
+    paste0(
+      "/Users/sarahlarson/Downloads/sports stats/114239_nfl_competition_files_published_analytics_final/train/output_2023_w",
+      wk,
+      ".csv"
+    )
+  )
+  
+  assign(paste0("week", wk, "_output_train"), df)
+}
+```
+
+
+```{r}
+input_names  <- sprintf("week%02d_input_train", 1:18)
+output_names <- sprintf("week%02d_output_train", 1:18)
+
+input_df <- bind_rows(mget(input_names))
+
+# combining all outputs into one big data frame
+output_df <- bind_rows(mget(output_names))
+```
+
+
+```{r}
+roster_df <- input_df %>%
+  distinct(game_id, play_id, nfl_id, player_side, player_role)
+
+output_df <- output_df %>%
+  left_join(roster_df, by = c("game_id", "play_id", "nfl_id"))
+```
+
+
+```{r}
+# which player is the targeted WR on each play
+targets <- input_df %>%
+  filter(player_role == "Targeted Receiver") %>%
+  distinct(game_id, play_id, wr_nfl_id = nfl_id)
+
+# frame of the THROW = last frame in input
+throw_frames <- input_df %>%
+  group_by(game_id, play_id) %>%
+  summarise(throw_frame = max(frame_id), .groups = "drop")
+
+# frame of the CATCH / arrival = last frame in output
+catch_frames <- output_df %>%
+  group_by(game_id, play_id) %>%
+  summarise(catch_frame = max(frame_id), .groups = "drop")
+
+```
+
+
+```{r}
+# WR position at throw
+wr_throw <- input_df %>%
+  inner_join(targets, by = c("game_id", "play_id", "nfl_id" = "wr_nfl_id")) %>%
+  inner_join(throw_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == throw_frame) %>%
+  transmute(game_id, play_id, wr_nfl_id = nfl_id,
+            wr_x0 = x, wr_y0 = y)
+
+# defenders at throw
+def_throw <- input_df %>%
+  inner_join(throw_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == throw_frame,
+         player_side == "Defense") %>%
+  transmute(game_id, play_id,
+            def_nfl_id = nfl_id,
+            def_x0 = x, def_y0 = y)
+
+# separation at throw = min distance to any defender
+sep_throw <- def_throw %>%
+  inner_join(wr_throw, by = c("game_id", "play_id")) %>%
+  mutate(dist0 = sqrt((wr_x0 - def_x0)^2 + (wr_y0 - def_y0)^2)) %>%
+  group_by(game_id, play_id, wr_nfl_id) %>%
+  summarise(sep_t0 = min(dist0, na.rm = TRUE), .groups = "drop")
+
+```
+
+
+```{r}
+# WR position at catch frame
+wr_catch <- output_df %>%
+  inner_join(targets, by = c("game_id", "play_id", "nfl_id" = "wr_nfl_id")) %>%
+  inner_join(catch_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == catch_frame) %>%
+  transmute(game_id, play_id, wr_nfl_id = nfl_id,
+            wr_x1 = x, wr_y1 = y)
+
+# defenders at catch frame
+def_catch <- output_df %>%
+  inner_join(catch_frames, by = c("game_id", "play_id")) %>%
+  filter(frame_id == catch_frame,
+         player_side == "Defense") %>%
+  transmute(game_id, play_id,
+            def_nfl_id = nfl_id,
+            def_x1 = x, def_y1 = y)
+
+# separation at catch = min distance to any defender
+sep_catch <- def_catch %>%
+  inner_join(wr_catch, by = c("game_id", "play_id")) %>%
+  mutate(dist1 = sqrt((wr_x1 - def_x1)^2 + (wr_y1 - def_y1)^2)) %>%
+  group_by(game_id, play_id, wr_nfl_id) %>%
+  summarise(sep_t1 = min(dist1, na.rm = TRUE), .groups = "drop")
+
+```
+
+
+```{r}
+# In-Air Separation Gain
+iasg_df <- sep_throw %>%
+  inner_join(sep_catch, by = c("game_id", "play_id", "wr_nfl_id")) %>%
+  mutate(IASG = sep_t1 - sep_t0)
+
+# bring in supplementary data (routes, coverage, pass_result, etc.)
+plays_enriched <- iasg_df %>%
+  inner_join(supp_data, by = c("game_id", "play_id")) %>%
+  select(game_id, play_id, wr_nfl_id,
+         route_of_targeted_receiver,
+         team_coverage_man_zone,
+         pass_result,
+         sep_t0, sep_t1, IASG,
+         everything())
+```
+
+
+```{r}
+plays_enriched %>%
+  group_by(route_of_targeted_receiver, team_coverage_man_zone) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    mean_sep_t0 = mean(sep_t0, na.rm = TRUE),
+    mean_sep_t1 = mean(sep_t1, na.rm = TRUE)
+  ) %>%
+  arrange(desc(mean_IASG))
+
+
+plays_clean <- plays_enriched %>%
+  filter(
+    !is.na(IASG),
+    !is.na(route_of_targeted_receiver),
+    !is.na(team_coverage_man_zone)
+  )
+
+route_cov_summary <- plays_clean %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n         = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    mean_sep_t0 = mean(sep_t0, na.rm = TRUE),
+    mean_sep_t1 = mean(sep_t1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 150) %>%
+  arrange(desc(mean_IASG))
+```
+
+
+```{r}
+ggplot(route_cov_summary,
+       aes(x = reorder(route_of_targeted_receiver, mean_IASG),
+           y = mean_IASG,
+           fill = coverage_simple)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "In-Air Separation Gain by Route and Coverage",
+    x = "Route of Targeted Receiver",
+    y = "Mean In-Air Separation Gain (yards)",
+    fill = "Coverage Type"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+This figure presents the mean In-Air Separation Gain (IASG) across all major route types, separated by man and zone coverage. The results reveal clear structural differences in how routes interact with defensive schemes. Vertical and space-attacking routes—such as corner, post, go, and crossing routes—tend to generate positive IASG, particularly against zone coverage, where defenders must pass off receivers and adjust to route combinations. In these situations, receivers often find expanding pockets of space as the ball travels, producing meaningful gains in separation. In contrast, routes that break back toward the quarterback or occur near the line of scrimmage—such as screen, angle, flat, hitch, and slant routes—consistently show negative IASG, indicating that defenders close separation during the ball’s flight. These decreases are largest in zone coverage, where downhill defenders converge quickly on short targets. Across nearly all route families, zone coverage produces higher IASG than man coverage, reinforcing the idea that receivers gain more space by exploiting zone structure than by outrunning individual defenders. Overall, the figure highlights how IASG is fundamentally route-dependent and mediated by the geometry of coverage responsibilities.
+
+
+```{r}
+plays_enriched <- plays_enriched %>%
+  mutate(
+    complete = ifelse(pass_result == "C", 1, 0),
+    team_coverage_man_zone = as.factor(team_coverage_man_zone)
+  )
+
+completion_model <- glm(
+  complete ~ IASG + team_coverage_man_zone,
+  data = plays_enriched,
+  family = binomial
+)
+
+summary(completion_model)
+
+
+pred <- ggpredict(completion_model, terms = c("IASG [all]", "team_coverage_man_zone")) %>%
+  as.data.frame() %>%
+  rename(
+    IASG = x,
+    predicted = predicted,
+    conf_low = conf.low,
+    conf_high = conf.high,
+    coverage = group
+  )
+
+# Plot
+ggplot(pred, aes(x = IASG, y = predicted, color = coverage)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(x = IASG, ymin = conf_low, ymax = conf_high, fill = coverage),
+              alpha = 0.2, inherit.aes = FALSE) +
+  labs(
+    title = "Predicted Completion Probability by IASG and Coverage",
+    x = "In-Air Separation Gain (IASG)",
+    y = "Predicted Completion Probability",
+    color = "Coverage",
+    fill = "Coverage"
+  ) +
+  theme_minimal()
+```
+
+
+A logistic regression model relating completion probability to IASG and coverage type shows a strong positive association between IASG and the likelihood of a completed pass. Completion probability rises steadily with increasing IASG in both coverage types but increases more steeply under zone coverage. This indicates that separation gained during the ball’s flight is particularly valuable in defeating zone defenses. Even when IASG is negative, zone coverage offers a modest baseline advantage in completion probability, while positive IASG magnifies that advantage further. This graph goes up to 40 yards of IASG, which we know is not a very common pass length, but you can still see the predicted completion probability is still positive when cutting down to even just 20 yards. 
+
+
+```{r}
+set.seed(310)  
+
+plays_sample <- plays_clean %>%
+  sample_n(size = min(5000, n())) %>%  
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  )
+
+ggplot(plays_sample,
+       aes(x = sep_t0,
+           y = sep_t1,
+           color = coverage_simple)) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Separation at Throw vs at Arrival",
+    subtitle = "Points above the line = WR gets more open during balls flight (positive IASG)",
+    x = "Separation at Throw (yards)",
+    y = "Separation at Arrival (yards)",
+    color = "Coverage"
+  )
+```
+
+
+The scatterplot of separation at throw versus separation at arrival illustrates that most plays cluster near the diagonal, implying relatively small changes in separation during the ball’s flight. However, a notable subset lies above the diagonal, indicating that certain plays exhibit meaningful positive IASG where receivers create additional daylight after the throw. These instances occur more frequently against zone coverage, as defenders in zone responsibilities tend to pass routes between zones, creating opportunities for receivers to exploit moving pockets of space. Man coverage displays a much tighter cluster, consistent with defenders following their assigned receivers closely throughout the play.
+
+
+```{r}
+plays_depth <- plays_clean %>%
+  mutate(
+    pass_len_bucket = case_when(
+      pass_length < 0              ~ "< 0 (Behind LOS)",
+      pass_length >= 0 & pass_length < 10  ~ "0–9",
+      pass_length >= 10 & pass_length < 20 ~ "10–19",
+      pass_length >= 20 & pass_length < 30 ~ "20–29",
+      pass_length >= 30                   ~ "30+",
+      TRUE ~ "Unknown"
+    ),
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  )
+
+depth_summary <- plays_depth %>%
+  filter(pass_len_bucket != "Unknown") %>%
+  group_by(pass_len_bucket, coverage_simple) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(depth_summary,
+       aes(x = pass_len_bucket,
+           y = mean_IASG,
+           group = coverage_simple,
+           color = coverage_simple)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Mean IASG by Depth of Target and Coverage",
+    x = "Pass Length Bucket (yards past LOS)",
+    y = "Mean IASG (yards)",
+    color = "Coverage"
+  )
+
+```
+
+
+IASG varies systematically with pass depth. Behind-the-line-of-scrimmage throws produce the most negative IASG values; these plays, such as screens, allow defenders to close rapidly downhill. Shallow and intermediate passes show progressively improved IASG, and passes in the 10-29 yard range generally exhibit the highest positive gains. Deep passes beyond 30 yards show a decrease in IASG relative to intermediate throws, suggesting that defenders' recoverability and ball-tracking ability limit the receiver’s capacity to gain separation on longer targets.
+
+
+```{r}
+## Team-level IASG: offense
+
+offense_summary <- plays_clean %>%
+  group_by(possession_team) %>%
+  summarise(
+    n = n(),
+    mean_IASG = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%           # drop tiny-sample teams if needed
+  arrange(desc(mean_IASG))
+
+offense_summary
+
+ggplot(offense_summary,
+       aes(x = reorder(possession_team, mean_IASG),
+           y = mean_IASG)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Offensive Teams by In-Air Separation Gain",
+    x = "Offense Team",
+    y = "Mean IASG (yards)"
+  )
+
+## Team-level IASG: defense
+
+defense_summary <- plays_clean %>%
+  group_by(defensive_team) %>%
+  summarise(
+    n = n(),
+    mean_IASG_allowed = mean(IASG, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%
+  arrange(mean_IASG_allowed)    # low = good defense
+
+defense_summary
+
+ggplot(defense_summary,
+       aes(x = reorder(defensive_team, mean_IASG_allowed),
+           y = mean_IASG_allowed)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Defensive Teams by In-Air Separation Allowed",
+    x = "Defense Team",
+    y = "Mean IASG Allowed (yards)"
+  )
+```
+
+
+Team-level summaries reveal that offenses such as Tampa Bay, the Los Angeles Rams, Buffalo, Dallas, and San Francisco create the highest average IASG across their targeted pass plays. By contrast, teams such as Seattle, Chicago, Philadelphia, and Atlanta create the lowest IASG, suggesting that their receivers struggle to generate additional separation after the throw relative to the rest of the league.
+
+Defensively, Chicago, Minnesota, San Francisco, and Carolina allow the lowest IASG, indicating strong downstream coverage and pursuit. Conversely, Kansas City, Philadelphia, Dallas, and Atlanta allow relatively high IASG values, reflecting challenges in maintaining separation control once the ball is released.
+
+
+```{r}
+plays_adv <- plays_clean %>%
+  filter(!is.na(expected_points_added)) %>%
+  mutate(
+    WR_advantage = IASG * expected_points_added
+  )
+
+adv_route_cov <- plays_adv %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ team_coverage_man_zone
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n = n(),
+    mean_WR_adv = mean(WR_advantage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30) %>%
+  arrange(desc(mean_WR_adv))
+
+adv_route_cov
+
+
+ggplot(adv_route_cov,
+       aes(x = coverage_simple,
+           y = route_of_targeted_receiver,
+           fill = mean_WR_adv)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "WR Advantage Score (IASG × EPA) by Route and Coverage",
+    x = "Coverage",
+    y = "Route",
+    fill = "Mean WR Advantage"
+  )
+```
+
+
+This heatmap presents the WR Advantage Score—IASG multiplied by EPA—summarizing how valuable mid-air separation is for each route under man and zone coverage. Several patterns stand out. Wheel routes produce strong positive advantage in both coverages, reflecting their ability to create separation and generate high-value gains. Screens show a sharp split: highly negative in man coverage, where defenders close quickly, but strongly positive in zone coverage, where receivers can exploit space. Short and timing-based routes such as slants, hitches, and ins generally produce low or slightly negative advantage in man coverage, while their zone values rise toward neutral or mildly positive. Vertical and space-attacking concepts—corner, post, go, and cross—tend to yield consistent positive advantage scores across both coverages. Overall, the heatmap shows that the value of in-air separation varies substantially by route–coverage combination, with certain concepts (wheel, screen vs zone, flat vs zone) offering notably higher offensive upside.
+
+
+```{r}
+offense_adv <- plays_adv %>%
+  group_by(possession_team) %>%
+  summarise(
+    n = n(),
+    mean_WR_adv = mean(WR_advantage, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 50) %>%
+  arrange(desc(mean_WR_adv))
+
+ggplot(offense_adv,
+       aes(x = reorder(possession_team, mean_WR_adv),
+           y = mean_WR_adv)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Offensive Teams by WR Advantage (IASG × EPA)",
+    x = "Offense Team",
+    y = "Mean WR Advantage"
+  )
+
+```
+
+
+This graph ranks all NFL offenses by their WR Advantage Score, which combines in-air separation gain (IASG) with the play’s expected points added (EPA) to measure how effectively each team converts mid-air separation into real offensive value. The results show substantial variation across the league. New England, Pittsburgh, and Miami lead the NFL, indicating that their receivers generate separation in situations that meaningfully boost play value. Teams like Kansas City, Detroit, and Tennessee also grade highly, reflecting efficient route concepts and strong timing between quarterbacks and receivers. On the lower end, offenses such as Denver, Buffalo, and Houston generate little to no positive WR advantage, suggesting either limited mid-air separation or that the separation they do create is not translating into high-value outcomes. Overall, this chart highlights which offenses maximize separation into production and which struggle to turn space into EPA.
+
+
+```{r}
+plays_model <- plays_clean %>%
+  filter(
+    !is.na(IASG),
+    !is.na(route_of_targeted_receiver),
+    !is.na(team_coverage_man_zone),
+    !is.na(pass_length),
+    !is.na(defenders_in_the_box),
+    !is.na(dropback_type)
+  ) %>%
+  mutate(
+    route_of_targeted_receiver = as.factor(route_of_targeted_receiver),
+    team_coverage_man_zone     = as.factor(team_coverage_man_zone),
+    dropback_type              = as.factor(dropback_type)
+  )
+
+
+iasg_model <- lm(
+  IASG ~ route_of_targeted_receiver +
+    team_coverage_man_zone +
+    pass_length +
+    defenders_in_the_box +
+    dropback_type,
+  data = plays_model
+)
+
+summary(iasg_model)
+```
+
+
+This linear model quantifies how different play characteristics influence In-Air Separation Gain (IASG). Several route types show strong positive effects: cross, post, go, in, corner, and wheel routes all significantly increase IASG by roughly 0.95–1.33 yards, indicating that these deeper or horizontally stretching concepts tend to create additional separation while the ball is in flight. In contrast, screen routes are associated with a small but significant decrease in IASG, likely reflecting how quickly defenders close downhill on short throws. Zone coverage has a strong negative effect (–0.50 yards), confirming that defenders in zone leverage space better and limit mid-air separation compared to man. Additional contextual factors also matter: a longer pass length slightly increases IASG, and more defenders in the box correlates with greater separation—possibly due to fewer defenders available in coverage. Some dropback types, especially scramble-related plays, significantly reduce IASG, showing that off-script throws often occur under tighter defensive pressure. Overall, the model highlights that route design and defensive structure are the dominant drivers of separation changes in the air.
+
+
+```{r}
+plays_model <- plays_model %>%
+  mutate(
+    IASG_exp = predict(iasg_model, newdata = .),
+    SAOE     = IASG - IASG_exp   
+  )
+
+
+plays_enriched <- plays_enriched %>%
+  left_join(
+    plays_model %>%
+      select(game_id, play_id, wr_nfl_id, IASG_exp, SAOE),
+    by = c("game_id", "play_id", "wr_nfl_id")
+  )
+```
+
+
+```{r}
+route_cov_saoe <- plays_model %>%
+  mutate(
+    coverage_simple = case_when(
+      team_coverage_man_zone == "MAN_COVERAGE"  ~ "Man",
+      team_coverage_man_zone == "ZONE_COVERAGE" ~ "Zone",
+      TRUE ~ as.character(team_coverage_man_zone)
+    )
+  ) %>%
+  group_by(route_of_targeted_receiver, coverage_simple) %>%
+  summarise(
+    n         = n(),
+    mean_SAOE = mean(SAOE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 30) %>%
+  arrange(desc(mean_SAOE))
+
+route_cov_saoe
+
+ggplot(route_cov_saoe,
+       aes(x = coverage_simple,
+           y = route_of_targeted_receiver,
+           fill = mean_SAOE)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "darkred",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0
+  ) +
+  labs(
+    title = "Separation Added Over Expectation (SAOE) by Route and Coverage",
+    x = "Coverage",
+    y = "Route",
+    fill = "Mean SAOE (yards)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+
+This heatmap shows how much separation receivers generate relative to expectation (SAOE) across different route types and coverages. Several routes stand out under man coverage, with angle, corner, and flat routes producing the highest positive SAOE—meaning receivers are consistently creating more separation than expected on these concepts when matched one-on-one. In contrast, routes like slant, in, and go tend to underperform expectation in man, suggesting defenders are better positioned to contest those breaks. Under zone coverage, most routes cluster closer to zero, indicating more stable and predictable separation outcomes. However, screen and wheel routes show notably positive SAOE in zone, reflecting how these designs exploit space and leverage blockers or vertical stress. Overall, the plot highlights that route effectiveness is highly coverage-dependent, with man coverage producing more variation in separation creation and certain route families consistently outperforming their expected benchmarks.
+
+
+```{r}
+wr_saoe <- plays_model %>%
+  group_by(wr_nfl_id) %>%
+  summarise(
+    n = n(),
+    mean_SAOE = mean(SAOE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n >= 20) %>%   # require enough targets
+  arrange(desc(mean_SAOE))
+
+
+player_lookup <- input_df %>%
+  distinct(nfl_id, player_name) %>%
+  filter(!is.na(nfl_id), !is.na(player_name))
+
+wr_saoe_named <- wr_saoe %>%
+  left_join(player_lookup, by = c("wr_nfl_id" = "nfl_id")) %>%
+  arrange(desc(mean_SAOE))
+
+head(wr_saoe_named, 20)
+```
+
+
+After adjusting for contextual factors in the IASG regression model, SAOE identifies individual players who consistently outperform expectation. The highest-graded players include Saquon Barkley, Kalif Raymond, Donald Parham, Antonio Gibson, and Christian McCaffrey. Although several of these players are running backs or hybrid personnel, their route types and usage patterns frequently place them in underneath matchups against linebackers or zone coverage defenders, enabling them to outperform the separation gains predicted by the model. The SAOE leaderboard underscores that separation excellence is not limited to traditional wide receivers and that certain players excel at creating unexpected space regardless of play design.
+
+
+### Discussion
+
+Our analysis provides a detailed look into how receivers create separation both at the catch point and while the ball is in flight, as well as how these movement-based advantages translate into play value. Across the league, we observe consistent negative mean In-Air Separation Gain (IASG), confirming that defenders generally close space after the ball is thrown. Still, meaningful variation exists across routes, coverage types, and teams, which highlights that IASG captures something real about receiver separation skill and defensive structure.
+
+Route-level differences reveal clear patterns: horizontal-breaking routes such as out, in, slant, and cross generate better IASG in man coverage, while zone coverage favors space-oriented designs like screens, flats, and angle routes. The regression model reinforces these findings—most route coefficients are strongly positive relative to the baseline, confirming that route identity is one of the strongest predictors of in-flight separation. At the same time, the negative coefficient for zone coverage shows that IASG tends to be smaller when defenses drop into space rather than match receivers directly.
+
+Team-level trends also illustrate systematic differences in passing structure. Offensively, teams like New England, Pittsburgh, and Miami create far more WR advantage (IASG × EPA), suggesting that their route concepts and timing allow receivers to translate separation into valuable outcomes. Defensively, stifling units like Carolina, Minnesota, and Chicago allow the least in-flight separation, while others consistently leave receivers more room to operate. These findings open the door to studying whether teams are winning through scheme, personnel, or both.
+
+Finally, the predictive model connecting IASG to completion probability shows a clear positive relationship: as receivers gain more separation in-flight, completion likelihood increases across both man and zone. However, zone coverage is systematically more forgiving, producing higher baseline completion probabilities at similar IASG levels. This reinforces IASG as a meaningful performance metric—not just a geometric measure, but a driver of play success.
+
+Altogether, the results demonstrate that in-flight separation is a dynamic and informative dimension of receiver performance that varies at the player, route, coverage, and team levels.
+
+### Conclusion
+
+This project examined In-Air Separation Gain (IASG) as a novel way to quantify receiver performance during the most important phase of a passing play—the time between the throw and arrival. We found that IASG reliably captures meaningful differences in how receivers separate across route types, defensive coverages, and team systems. High-IASG routes and players tended to be the same ones that produced better efficiency outcomes, and IASG proved to be a significant predictor of completion probability even after controlling for route, coverage, pass depth, and play design.
+
+The analysis shows that IASG can serve as a useful evaluative tool for both coaching staffs and analytics groups. It can help identify receivers who excel at late separation, diagnose defensive coverage vulnerabilities, and assess the fit between route concepts and opponent tendencies. Future work could integrate tracking-derived speed and acceleration features, evaluate quarterback timing effects, or explore IASG stability week-to-week and season-to-season. Expanding the model to quantify defender-specific “In-Air Closing Ability” would also create a complementary metric for defensive backs. Overall, IASG offers a meaningful, actionable lens into passing-game performance, bridging movement data with on-field outcomes.
